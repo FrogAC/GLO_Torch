@@ -1,6 +1,8 @@
 from __future__ import print_function
-import torch
 import os
+import argparse as arg
+
+import torch
 import torch.nn as nn
 import torch.nn.parallel
 import torch.optim as optim
@@ -9,12 +11,9 @@ import torchvision.datasets as dset
 import torchvision.transforms as transforms
 import torchvision.utils as vutils
 import matplotlib.pyplot as plt
-import matplotlib.gridspec as gridspec
-import numpy as np
-import argparse as arg
-from torch.autograd import Variable
 import matplotlib.animation as animation
-from torch.utils.data.dataloader import default_collate 
+import numpy as np
+from torch.autograd import Variable
 
 # gpu
 device = torch.device("cuda:0" if (torch.cuda.is_available()) else "cpu")
@@ -25,16 +24,15 @@ latent_size = 2
 image_size = 32
 image_channels = 1
 
-learning_rate_net = 0.0002
-learning_rate_latent = 0.003
-adam_momentum = 0.5
-
+learning_rate_net = 2e-4 #5e-4
+learning_rate_latent = 1e-3 #1e-3
+adam_momentum = 0.5 # 0.5
 
 class Generator(nn.Module):
     def __init__(self):
        super(Generator, self).__init__()
        self.net = nn.Sequential(
-            nn.ConvTranspose2d(latent_size, image_size * 4, 4, 1,0, bias = True),
+            nn.ConvTranspose2d(latent_size, image_size * 4, 4, 1, 0, bias = True),
             nn.BatchNorm2d(image_size * 4),
             nn.ReLU(True),
             # 4
@@ -47,7 +45,7 @@ class Generator(nn.Module):
             nn.ReLU(True),
             # 16
             nn.ConvTranspose2d(image_size, image_channels, 4, 2, 1, bias = True),
-            nn.Sigmoid(),
+            nn.Tanh(),
             # img_channel * 32 * 32
        )
     
@@ -65,28 +63,30 @@ class IndexedMNIST(torch.utils.data.Dataset):
     def __len__(self):
         return len(self.mnist)
 
+def tanhScale(x):
+    return x * 2 - 1
+
 # custom data loader
 def get_loader(train = True, batch = True):
-    # load data
+    # load data, mnist from -1 to 1 to match tanh
     image_transform = transforms.Compose([
         transforms.Resize(image_size),
-        transforms.ToTensor()])
+        transforms.ToTensor(), # [0,1]
+        transforms.Lambda(tanhScale) # [-1,1]
+        ])
     dataset = IndexedMNIST(root = './data/mnist', download = True, transform = image_transform)
-    dataloader = torch.utils.data.DataLoader(dataset, batch_size = batch_size if batch else 1, shuffle = True, num_workers = 2, drop_last = True)
+    dataloader = torch.utils.data.DataLoader(dataset, batch_size = batch_size if batch else 1, shuffle = True, num_workers = 4, drop_last = True)
     return dataset, dataloader
 
-# inline projection
+# inline projection. z: (b_size, d, 1, 1)
 def projectl2(z):
     norm = torch.sqrt(torch.sum(z**2, axis=1))[:,np.newaxis]
     return z/torch.max(torch.ones_like(norm), norm)
 
 # for conv and batch-normlize
 def weights_init(m):
-    if type(m) in [nn.ConvTranspose2d, nn.Conv2d]:
+    if type(m) in [nn.ConvTranspose2d, nn.BatchNorm2d]:
         nn.init.normal_(m.weight.data, 0.0, 0.02)
-    elif type(m) == nn.BatchNorm2d:
-        nn.init.normal_(m.weight.data, 1.0, 0.02)
-        nn.init.constant_(m.bias.data, 0)
 
 def get_file_path(name):
     path = os.path.join('.','save')
@@ -150,13 +150,13 @@ def test(num_epochs, name):
         # save latent_z for visualization
         recon_img = gen_images.detach().view((image_channels,image_size,image_size)).cpu()
         target_image = real_images.view((image_channels,image_size,image_size)).cpu()
-        img_list.append(vutils.make_grid([recon_img, target_image], padding = 1, normalize = False))
+        img_list.append(vutils.make_grid([recon_img, target_image], padding = 1, normalize = True))
     return img_list, loss_list
 
 def train(num_epochs, name, hot_start = False):
     # dataset
     dataset, dataloader = get_loader(train = True, batch = True)
-    
+
     netG = Generator().to(device)
 
     # graded z used for learning
@@ -190,43 +190,46 @@ def train(num_epochs, name, hot_start = False):
         optimizer.load_state_dict(saved['optimizer'])
         epoch_start = saved['epoch']
 
-    with torch.autograd.set_detect_anomaly(True):
-        for epoch in range(epoch_start, num_epochs):
-            for i, (batch_data,_, idx) in enumerate(dataloader):
-                # extract batch and prepare z for optim
-                batch_z.data = latent_z[idx]
-                optimizer.zero_grad()
+    # with torch.autograd.set_detect_anomaly(True):
+    for epoch in range(epoch_start, num_epochs):
+        avgloss = 0
+        for i, (batch_data,_, idx) in enumerate(dataloader):
+            # extract batch and prepare z for optim
+            batch_z.data = latent_z[idx]
+            optimizer.zero_grad()
 
-                gen_images = netG(batch_z)
-                real_images = batch_data.to(device)
-                loss = criterion(real_images.view(-1), gen_images.view(-1))
+            gen_images = netG(batch_z)
+            real_images = batch_data.to(device)
+            loss = criterion(real_images.view(-1), gen_images.view(-1))
 
-                # step network and optiizer
-                loss.backward()
-                optimizer.step()
+            # step
+            loss.backward()
+            optimizer.step()
 
-                # project z and update
-                latent_z[idx] = projectl2(batch_z)
+            # project z after update
+            latent_z[idx] = projectl2(batch_z)
 
-                # output stats
-                if i % 100 == 0:
-                    # save loss
-                    loss_list.append(loss.item())
-                    print('[{:d},{:d}]\tloss: {:.4f}'.format(epoch, i, loss))
+            # save loss
+            avgloss += loss.item()
 
-            if epoch % 5 == 0:
-                # save check points
-                torch.save({
-                    'epoch': epoch + 1,
-                    'model': netG.state_dict(),
-                    'optimizer': optimizer.state_dict(),
-                    'latent': latent_z
-                }, get_file_path(name))
+        # sates save
+        avgloss /= len(dataloader)
+        loss_list.append(avgloss)
+        print('[{:d}]\tloss: {:.4f}'.format(epoch, avgloss))
 
-                # store result of each epoch
-                with torch.no_grad():
-                    outputG = netG(latent_z[[999,888,777,666]].reshape(4,latent_size,1,1).detach()).cpu()
-                img_list.append(vutils.make_grid(outputG, padding = 2))
+        if epoch % 10 == 0:
+            # save check points
+            torch.save({
+                'epoch': epoch + 1,
+                'model': netG.state_dict(),
+                'optimizer': optimizer.state_dict(),
+                'latent': latent_z
+            }, get_file_path(name))
+
+            # store image result
+            with torch.no_grad():
+                outputG = netG(latent_z[[999,888,777,666]].reshape(4,latent_size,1,1).detach()).cpu()
+            img_list.append(vutils.make_grid(outputG, padding = 2, normalize = True))
 
     # save result to file
     torch.save({
@@ -238,7 +241,7 @@ def train(num_epochs, name, hot_start = False):
 
     return img_list, loss_list
 
-def vis(name):
+def vis(name, row_col):
     saved = torch.load(get_file_path(name))
     
     netG =Generator().to(device)
@@ -251,19 +254,21 @@ def vis(name):
     # vis the latent disk on grid
     fig = plt.figure(figsize=(12,12))
 
-    row = 24
-    col = 24
+    row = row_col
+    col = row_col
     for i in range(row):
         for j in range(col):
             ii = (i / row) * 2 - 1
             jj = (j / col) * 2 - 1
-            if ii ** 2 + jj ** 2 > 1 :
-                npimg = np.zeros((image_size, image_size))
-            else:
-                latent = torch.FloatTensor([ii,jj]).to(device)
-                cpuimg = netG(latent.view((1,2,1,1))).view((image_size, image_size)).detach().cpu()
-                npimg = cpuimg.numpy()
-            ax = fig.add_subplot(row, col, i*row+j+1)
+            # if ii ** 2 + jj ** 2 > 10 :
+            #     npimg = np.zeros((image_size, image_size))
+            # else:
+            latent = torch.FloatTensor([ii,jj]).to(device)
+            cpuimg = netG(latent.view((1,2,1,1))).view((image_size, image_size)).detach().cpu()
+            npimg = cpuimg.numpy()
+            npimg = (npimg + 1) / 2  # [0,1]
+
+            ax = fig.add_subplot(row, col, i*col+j+1)
             ax.set_xticks([])
             ax.set_yticks([])
             plt.imshow(npimg)
@@ -278,13 +283,13 @@ if __name__ == '__main__':
     parser.add_argument('--test',action='store_true', help='run test')
     parser.add_argument('--load',action='store_true', help='hot start')
     parser.add_argument('name', type=str)
-    parser.add_argument('epoch', nargs='?', type=int)
+    parser.add_argument('epoch',type=int, help = 'r')
     args = parser.parse_args()
 
     if args.vis:
-        vis(args.name)
+        vis(args.name, args.epoch)
     else:
-        if args.test:
+        if not args.test:
             res_imgs, res_loss = train(args.epoch, args.name, hot_start = args.load)
             # animation G
             fig = plt.figure(figsize=(8,8))
